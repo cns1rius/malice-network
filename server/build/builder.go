@@ -8,7 +8,6 @@ import (
 	"github.com/chainreactors/malice-network/helper/consts"
 	"github.com/chainreactors/malice-network/helper/proto/client/clientpb"
 	"github.com/chainreactors/malice-network/helper/types"
-	"github.com/chainreactors/malice-network/helper/utils/formatutils"
 	"github.com/chainreactors/malice-network/server/internal/core"
 	"github.com/chainreactors/malice-network/server/internal/db"
 )
@@ -24,7 +23,7 @@ type Builder interface {
 
 	Execute() error
 
-	Collect() (string, string)
+	Collect() (string, string, error)
 }
 
 func NewBuilder(req *clientpb.BuildConfig) (Builder, error) {
@@ -74,7 +73,7 @@ var (
 	dockerBuildSemaphore = make(chan struct{}, maxDockerBuildConcurrency)
 )
 
-func SendBuildMsg(artifact *clientpb.Artifact, status string, params []byte) {
+func SendBuildMsg(artifact *clientpb.Artifact, status string, params []byte, err error) {
 	if core.EventBroker == nil {
 		return
 	}
@@ -85,18 +84,19 @@ func SendBuildMsg(artifact *clientpb.Artifact, status string, params []byte) {
 	}
 	if status == consts.BuildStatusCompleted {
 		event.Message = fmt.Sprintf("Artifact completed %s (type: %s, target: %s, source: %s)", artifact.Name, artifact.Type, artifact.Target, artifact.Source)
-		profileParams, err := types.UnmarshalProfileParams(params)
-		if err != nil {
-			logs.Log.Errorf("failed to unmarshal profile params: %v", err)
-			return
+		if len(params) > 0 {
+			profileParams, err := types.UnmarshalProfileParams(params)
+			if err != nil {
+				logs.Log.Errorf("failed to unmarshal profile params: %v", err)
+				return
+			}
+			if profileParams.AutoDownload {
+				event.Op = consts.CtrlArtifactDownload
+				event.Job = &clientpb.Job{Name: artifact.Name}
+			}
 		}
-		if profileParams.AutoDownload {
-			event.Op = consts.CtrlArtifactDownload
-			event.Job = &clientpb.Job{Name: artifact.Name}
-		}
-
 	} else if status == consts.BuildStatusFailure {
-		event.Message = fmt.Sprintf("Artifact failed %s (type: %s, target: %s, source: %s)", artifact.Name, artifact.Type, artifact.Target, artifact.Source)
+		event.Message = fmt.Sprintf("Artifact failed %s (type: %s, target: %s, source: %s): %v", artifact.Name, artifact.Type, artifact.Target, artifact.Source, err)
 	} else {
 		return
 	}
@@ -115,17 +115,10 @@ func AmountArtifact(artifactName string) error {
 		return true
 	})
 	for _, pipe := range result {
-		en := formatutils.Encode(artifactName)
-		content := &clientpb.WebContent{
-			WebsiteId: pipe.Name,
-			Path:      en,
-			Type:      consts.ArtifactWebcontent,
-		}
-		_, err := db.AddContent(content)
+		content, err := db.AddAmountWebContent(artifactName, pipe.Name)
 		if err != nil {
 			return err
 		}
-		content.Path = artifactName
 		lns, _ := core.Listeners.Get(pipe.ListenerId)
 		lns.PushCtrl(&clientpb.JobCtrl{
 			Ctrl: consts.CtrlWebContentAddArtifact,
